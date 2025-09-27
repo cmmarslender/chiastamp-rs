@@ -1,5 +1,5 @@
 use crate::merkle_tree::tree::{ProofStep, build_merkle_root, merkle_proof};
-use crate::models::NewRecord;
+use crate::models::{NewRecord, Record};
 use axum::http::StatusCode;
 use axum::{Json, Router, extract::State, http, routing::post};
 use diesel::prelude::*;
@@ -92,27 +92,41 @@ async fn stamp(
         )
     })?;
 
-    // Insert into the DB
+    // Check if record with same hash already exists
     let mut conn = state.db_pool.get().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("DB connection error: {e}"),
         )
     })?;
-    let new_record = NewRecord {
-        hash: hash_array.as_slice(),
-    };
-    conn.transaction(|conn| {
-        diesel::insert_into(schema::records::table)
-            .values(&new_record)
-            .execute(conn)
-    })
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Database insert failed".to_string(),
-        )
-    })?;
+
+    let existing_record: Option<Record> = schema::records::table
+        .filter(schema::records::hash.eq(hash_array.as_slice()))
+        .first::<Record>(&mut conn)
+        .optional()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database query error: {e}"),
+            )
+        })?;
+
+    if existing_record.is_none() {
+        let new_record = NewRecord {
+            hash: hash_array.as_slice(),
+        };
+        conn.transaction(|conn| {
+            diesel::insert_into(schema::records::table)
+                .values(&new_record)
+                .execute(conn)
+        })
+        .map_err(|_e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database insert failed".to_string(),
+            )
+        })?;
+    }
 
     // @TODO get all other pending leaves from the database, in order
     // Or perhaps, that doesn't even matter, and what we need to return with a stamp is just a confirmation
