@@ -57,7 +57,7 @@ pub fn merkle_proof(leaves: &[[u8; 32]], index: usize) -> Vec<ProofStep> {
 
                 // does this pair contain our target? If not, it shouldn't be in the proof
                 if idx / 2 == pair_index {
-                    if idx % 2 == 0 && idx < current_level.len() - 1 {
+                    if idx.is_multiple_of(2) && idx < current_level.len() - 1 {
                         // target is left, sibling is right
                         proof.push(ProofStep {
                             hash: hex::encode(right),

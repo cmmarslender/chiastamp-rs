@@ -1,19 +1,20 @@
-use crate::merkle_tree::tree::{ProofStep, build_merkle_root, merkle_proof, verify_proof};
+use crate::merkle_tree::tree::{ProofStep, build_merkle_root, merkle_proof};
+use crate::models::{NewRecord};
 use axum::http::StatusCode;
-use axum::serve::Listener;
 use axum::{Json, Router, extract::State, http, routing::post};
+use diesel::prelude::*;
+use diesel::r2d2::ConnectionManager;
+use diesel::r2d2::Pool;
+use dotenvy::dotenv;
 use log::info;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{
-    collections::HashMap,
-    io,
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-};
+use std::{env, net::SocketAddr};
 use tower_http::cors::{Any, CorsLayer};
 
-mod merkle_tree;
+pub mod merkle_tree;
+pub mod models;
+mod schema;
 
 #[derive(Serialize, Deserialize)]
 pub struct StampRequest {
@@ -29,17 +30,32 @@ pub struct StampResponse {
     pub proof: Vec<ProofStep>,
 }
 
+pub type DbPool = Pool<ConnectionManager<MysqlConnection>>;
+#[derive(Clone)]
+pub struct AppState {
+    pub db_pool: DbPool,
+}
+
 #[tokio::main]
 async fn main() {
+    dotenv().ok();
     env_logger::init();
-    let port: u16 = 8080;
 
+    let pool = get_connection_pool();
+    let state = AppState { db_pool: pool };
+
+    let port: u16 = env::var("PORT")
+        .expect("PORT must be defined")
+        .parse()
+        .expect("PORT must be a valid u16");
     let cors = CorsLayer::new()
         .allow_methods([http::Method::POST])
         .allow_origin(Any)
         .allow_headers(Any);
-
-    let app = Router::new().route("/stamp", post(stamp)).layer(cors);
+    let app = Router::new()
+        .route("/stamp", post(stamp))
+        .with_state(state)
+        .layer(cors);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("Listening on {addr}");
@@ -48,8 +64,17 @@ async fn main() {
         .unwrap();
 }
 
+pub fn get_connection_pool() -> Pool<ConnectionManager<MysqlConnection>> {
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let manager = ConnectionManager::<MysqlConnection>::new(database_url);
+    Pool::builder()
+        .test_on_check_out(true)
+        .build(manager)
+        .expect("Could not build connection pool")
+}
+
 async fn stamp(
-    //State(state): State<AppState>,
+    State(state): State<AppState>,
     Json(payload): Json<StampRequest>,
 ) -> Result<Json<StampResponse>, (StatusCode, String)> {
     let hash_bytes =
@@ -66,6 +91,18 @@ async fn stamp(
             "Failed to convert hash".to_string(),
         )
     })?;
+
+    // Insert into the DB
+    let mut conn = state.db_pool.get().expect("Unable to get db connection");
+    let new_record = NewRecord {
+        hash: hash_array.as_slice(),
+    };
+    conn.transaction(|conn| {
+        diesel::insert_into(schema::records::table)
+            .values(&new_record)
+            .execute(conn)
+    })
+    .expect("error saving record");
 
     // @TODO get all other pending leaves from the database, in order
     // Or perhaps, that doesn't even matter, and what we need to return with a stamp is just a confirmation
