@@ -1,5 +1,5 @@
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
 #[serde(rename_all = "lowercase")] // ensures "left"/"right" in JSON
@@ -10,7 +10,7 @@ pub enum Position {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProofStep {
-    pub hash: String, // Hex string
+    pub hash: String,       // Hex string
     pub position: Position, // Left or Right
 }
 
@@ -86,11 +86,7 @@ pub fn merkle_proof(leaves: &[[u8; 32]], index: usize) -> Vec<ProofStep> {
     proof
 }
 
-pub fn verify_proof(
-    leaf: [u8; 32],
-    root: [u8; 32],
-    proof: &[ProofStep],
-) -> bool {
+pub fn verify_proof(leaf: [u8; 32], root: [u8; 32], proof: &[ProofStep]) -> bool {
     let mut computed = leaf;
 
     for step in proof {
@@ -111,7 +107,7 @@ pub fn verify_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
 
     fn hash_str(s: &str) -> [u8; 32] {
         Sha256::digest(s.as_bytes()).into()
@@ -131,15 +127,24 @@ mod tests {
         hasher.update(b);
         let expected: [u8; 32] = hasher.finalize().into();
 
-        assert_eq!(combined, expected, "hash_pair should equal direct SHA256(a||b)");
+        assert_eq!(
+            combined, expected,
+            "hash_pair should equal direct SHA256(a||b)"
+        );
     }
 
     #[test]
     fn test_root_with_single_leaf() {
         let leaves = vec![hash_str("a")];
         let root = build_merkle_root(&leaves);
-        assert_eq!(root, leaves[0], "Root of single leaf tree should equal the leaf");
-        assert_eq!("ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb", hex::encode(root))
+        assert_eq!(
+            root, leaves[0],
+            "Root of single leaf tree should equal the leaf"
+        );
+        assert_eq!(
+            "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+            hex::encode(root)
+        )
     }
 
     #[test]
@@ -149,7 +154,10 @@ mod tests {
 
         let expected = hash_pair(&leaves[0], &leaves[1]);
         assert_eq!(root, expected, "Root of 2-leaf tree should be hash(a||b)");
-        assert_eq!("e5a01fee14e0ed5c48714f22180f25ad8365b53f9779f79dc4a3d7e93963f94a", hex::encode(root))
+        assert_eq!(
+            "e5a01fee14e0ed5c48714f22180f25ad8365b53f9779f79dc4a3d7e93963f94a",
+            hex::encode(root)
+        )
     }
 
     #[test]
@@ -192,36 +200,24 @@ mod tests {
             position: Position::Right,
         });
         expected.push(ProofStep {
-            hash: hex::encode(
-                hash_pair(
-                    hash_str("g").as_slice(),
-                    hash_str("h").as_slice(),
-                )
-            ),
+            hash: hex::encode(hash_pair(
+                hash_str("g").as_slice(),
+                hash_str("h").as_slice(),
+            )),
             position: Position::Right,
         });
         expected.push(ProofStep {
-            hash: hex::encode(
-                hash_pair(
-                    hash_pair(
-                        hash_str("a").as_slice(),
-                        hash_str("b").as_slice(),
-                    ).as_slice(),
-                    hash_pair(
-                        hash_str("c").as_slice(),
-                        hash_str("d").as_slice(),
-                    ).as_slice(),
-                )
-            ),
+            hash: hex::encode(hash_pair(
+                hash_pair(hash_str("a").as_slice(), hash_str("b").as_slice()).as_slice(),
+                hash_pair(hash_str("c").as_slice(), hash_str("d").as_slice()).as_slice(),
+            )),
             position: Position::Left,
         });
         expected.push(ProofStep {
-            hash: hex::encode(
-                hash_pair(
-                    hash_str("i").as_slice(),
-                    hash_str("j").as_slice(),
-                )
-            ),
+            hash: hex::encode(hash_pair(
+                hash_str("i").as_slice(),
+                hash_str("j").as_slice(),
+            )),
             position: Position::Right,
         });
 
@@ -243,30 +239,18 @@ mod tests {
             position: Position::Left,
         });
         expected.push(ProofStep {
-            hash: hex::encode(
+            hash: hex::encode(hash_pair(
                 hash_pair(
-                    hash_pair(
-                        hash_pair(
-                            hash_str("a").as_slice(),
-                            hash_str("b").as_slice(),
-                        ).as_slice(),
-                        hash_pair(
-                            hash_str("c").as_slice(),
-                            hash_str("d").as_slice(),
-                        ).as_slice(),
-                    ).as_slice(),
-                    hash_pair(
-                        hash_pair(
-                            hash_str("e").as_slice(),
-                            hash_str("f").as_slice(),
-                        ).as_slice(),
-                        hash_pair(
-                            hash_str("g").as_slice(),
-                            hash_str("h").as_slice(),
-                        ).as_slice(),
-                    ).as_slice(),
+                    hash_pair(hash_str("a").as_slice(), hash_str("b").as_slice()).as_slice(),
+                    hash_pair(hash_str("c").as_slice(), hash_str("d").as_slice()).as_slice(),
                 )
-            ),
+                .as_slice(),
+                hash_pair(
+                    hash_pair(hash_str("e").as_slice(), hash_str("f").as_slice()).as_slice(),
+                    hash_pair(hash_str("g").as_slice(), hash_str("h").as_slice()).as_slice(),
+                )
+                .as_slice(),
+            )),
             position: Position::Left,
         });
 
@@ -282,36 +266,24 @@ mod tests {
             position: Position::Left,
         });
         expected.push(ProofStep {
-            hash: hex::encode(
-                hash_pair(
-                    hash_str("c").as_slice(),
-                    hash_str("d").as_slice(),
-                )
-            ),
+            hash: hex::encode(hash_pair(
+                hash_str("c").as_slice(),
+                hash_str("d").as_slice(),
+            )),
             position: Position::Right,
         });
         expected.push(ProofStep {
-            hash: hex::encode(
-                hash_pair(
-                    hash_pair(
-                        hash_str("e").as_slice(),
-                        hash_str("f").as_slice(),
-                    ).as_slice(),
-                    hash_pair(
-                        hash_str("g").as_slice(),
-                        hash_str("h").as_slice(),
-                    ).as_slice(),
-                )
-            ),
+            hash: hex::encode(hash_pair(
+                hash_pair(hash_str("e").as_slice(), hash_str("f").as_slice()).as_slice(),
+                hash_pair(hash_str("g").as_slice(), hash_str("h").as_slice()).as_slice(),
+            )),
             position: Position::Right,
         });
         expected.push(ProofStep {
-            hash: hex::encode(
-                hash_pair(
-                    hash_str("i").as_slice(),
-                    hash_str("j").as_slice(),
-                )
-            ),
+            hash: hex::encode(hash_pair(
+                hash_str("i").as_slice(),
+                hash_str("j").as_slice(),
+            )),
             position: Position::Right,
         });
 
