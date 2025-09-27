@@ -1,5 +1,5 @@
 use crate::merkle_tree::tree::{ProofStep, build_merkle_root, merkle_proof};
-use crate::models::{NewRecord};
+use crate::models::NewRecord;
 use axum::http::StatusCode;
 use axum::{Json, Router, extract::State, http, routing::post};
 use diesel::prelude::*;
@@ -93,7 +93,12 @@ async fn stamp(
     })?;
 
     // Insert into the DB
-    let mut conn = state.db_pool.get().expect("Unable to get db connection");
+    let mut conn = state.db_pool.get().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("DB connection error: {e}"),
+        )
+    })?;
     let new_record = NewRecord {
         hash: hash_array.as_slice(),
     };
@@ -102,7 +107,12 @@ async fn stamp(
             .values(&new_record)
             .execute(conn)
     })
-    .expect("error saving record");
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Database insert failed".to_string(),
+        )
+    })?;
 
     // @TODO get all other pending leaves from the database, in order
     // Or perhaps, that doesn't even matter, and what we need to return with a stamp is just a confirmation
