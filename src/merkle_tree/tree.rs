@@ -172,7 +172,7 @@ mod tests {
         for (i, leaf) in leaves.iter().enumerate() {
             let proof = merkle_proof(&leaves, i);
             assert!(
-                verify_proof(*leaf, root, &proof),
+                verify_proof(*leaf, root, &proof).unwrap(),
                 "Proof failed for index {}",
                 i
             );
@@ -209,8 +209,6 @@ mod tests {
             .iter()
             .map(|x| hash_str(x))
             .collect();
-
-        let root = build_merkle_root(&leaves);
 
         // Proof for "e" is:
         // f: right
@@ -277,6 +275,13 @@ mod tests {
             )),
             position: Position::Left,
         });
+        for (i, step) in proof.iter().enumerate() {
+            let proof_hash = step.hash.clone();
+            let proof_position = step.position;
+
+            assert_eq!(proof_hash, expected[i].hash);
+            assert_eq!(proof_position, expected[i].position);
+        }
 
         // Proof for "b" is:
         // a: left
@@ -332,7 +337,7 @@ mod tests {
         proof[0].hash = hex::encode([0u8; 32]);
 
         assert!(
-            !verify_proof(leaves[0], root, &proof),
+            !verify_proof(leaves[0], root, &proof).unwrap(),
             "Corrupted proof should not verify"
         );
     }
