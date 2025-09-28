@@ -179,7 +179,6 @@ async fn stamp(
         );
     }
 
-    // @TODO if the hash was for an old already included record, return the full proof
     // Now we need to get all pending records, in order, prior to the one we just inserted
     let current_record = existing_record.ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
