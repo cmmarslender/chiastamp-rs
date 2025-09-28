@@ -1,6 +1,6 @@
 use crate::merkle_tree::tree::{ProofStep, build_merkle_root, merkle_proof};
 use crate::models::{Batch, NewBatch, NewRecord, Record};
-use anyhow::{Result, bail, anyhow};
+use anyhow::{Result, anyhow, bail};
 use axum::http::StatusCode;
 use axum::{Json, Router, extract::State, http, routing::post};
 use chia_wallet_sdk::client::{
@@ -94,7 +94,8 @@ async fn main() -> Result<()> {
 }
 
 pub fn get_connection_pool() -> Result<Pool<ConnectionManager<MysqlConnection>>> {
-    let database_url = env::var("DATABASE_URL").map_err(|_e| anyhow!("DATABASE_URL must be set"))?;
+    let database_url =
+        env::var("DATABASE_URL").map_err(|_e| anyhow!("DATABASE_URL must be set"))?;
     let manager = ConnectionManager::<MysqlConnection>::new(database_url);
     Pool::builder()
         .test_on_check_out(true)
