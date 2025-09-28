@@ -14,6 +14,7 @@ pub struct ProofStep {
     pub position: Position, // Left or Right
 }
 
+#[must_use]
 pub fn hash_pair(left: &[u8], right: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(left);
@@ -21,6 +22,7 @@ pub fn hash_pair(left: &[u8], right: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+#[must_use]
 pub fn build_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     if leaves.is_empty() {
         return [0u8; 32];
@@ -42,6 +44,7 @@ pub fn build_merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     level[0]
 }
 
+#[must_use]
 pub fn merkle_proof(leaves: &[[u8; 32]], index: usize) -> Vec<ProofStep> {
     let mut proof = Vec::new();
     let mut idx = index;
