@@ -15,3 +15,10 @@ sha2 = "0.10.9"
 tokio = { version = "1.47.1", features = ["full"] }
 tower-http = { version = "0.6.6", features = ["cors"] }
 chrono = {  version = "0.4.42", features = ["serde"] }
+chia-wallet-sdk = { version = "0.30", features = ["rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+anyhow = "1.0.100"
+chia = "0.26.0"
+bip39 = "2.2.0"
+indexmap = "2.11.4"
+
