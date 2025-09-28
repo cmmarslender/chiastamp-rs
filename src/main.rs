@@ -8,7 +8,6 @@ use diesel::r2d2::Pool;
 use dotenvy::dotenv;
 use log::info;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{env, net::SocketAddr};
 use tower_http::cors::{Any, CorsLayer};
 
@@ -100,14 +99,14 @@ async fn stamp(
         )
     })?;
 
-    let existing_record: Option<Record> = schema::records::table
+    let mut existing_record: Option<Record> = schema::records::table
         .filter(schema::records::hash.eq(hash_array.as_slice()))
         .first::<Record>(&mut conn)
         .optional()
-        .map_err(|e| {
+        .map_err(|_e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database query error: {e}"),
+                "Error checking for existing records".to_string(),
             )
         })?;
 
@@ -126,28 +125,59 @@ async fn stamp(
                 "Database insert failed".to_string(),
             )
         })?;
+
+        // Get the newly inserted record
+        existing_record = Some(
+            schema::records::table
+                .filter(schema::records::hash.eq(hash_array.as_slice()))
+                .first::<Record>(&mut conn)
+                .map_err(|_e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Error loading record after insert".to_string(),
+                    )
+                })?,
+        );
     }
 
-    // @TODO get all other pending leaves from the database, in order
-    // Or perhaps, that doesn't even matter, and what we need to return with a stamp is just a confirmation
-    // and perhaps an internal identifier to make it easier to look up later?
-    // Order will have to be determined when we make the spend, and we can record order then
-    // and encode that in the final proof once a block is made
-    //let current_leaves: Vec<[u8; 32]> = vec![];
+    // @TODO if the hash was for an old already included record, return the full proof
+    // Now we need to get all pending records, in order, prior to the one we just inserted
+    let current_record = existing_record.ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Record not found after insert".to_string(),
+    ))?;
 
-    let leaf_values = ["a", "b", "c", "d", "e", "f"];
-    let mut current_leaves: Vec<[u8; 32]> = leaf_values
+    let other_records = schema::records::table
+        .filter(schema::records::batch_id.is_null())
+        .filter(schema::records::id.lt(current_record.id))
+        .order(schema::records::id.asc())
+        .get_results::<Record>(&mut conn)
+        .map_err(|_e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Error loading other records to compute partial proof".to_string(),
+            )
+        })?;
+
+    // Get all the existing pending records into the tree
+    let mut current_leaves: Vec<[u8; 32]> = other_records
         .iter()
         .map(|x| {
-            let mut hasher = Sha256::new();
-            hasher.update(x.as_bytes());
-            hasher.finalize().into()
+            x.hash.as_slice().try_into().map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Invalid hash format in database".to_string(),
+                )
+            })
         })
-        .collect();
+        .collect::<Result<Vec<[u8; 32]>, (StatusCode, String)>>()?;
+    // Add the new one
+    // This is current safe to do even if it's an old pending record, since
+    // we only fetch "current" leaves older than this hash
     current_leaves.push(hash_array);
 
     let root = build_merkle_root(&current_leaves);
-    let proof = merkle_proof(&current_leaves, current_leaves.len());
+    let proof = merkle_proof(&current_leaves, current_leaves.len() - 1);
 
     Ok(Json(StampResponse {
         root_hash: hex::encode(root),

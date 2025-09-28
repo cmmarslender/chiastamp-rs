@@ -180,6 +180,30 @@ mod tests {
     }
 
     #[test]
+    fn test_small_proofs() {
+        let leaves: Vec<[u8; 32]> = ["a"].iter().map(|x| hash_str(x)).collect();
+        let proof = merkle_proof(&leaves, 0);
+        assert_eq!(proof.len(), 0);
+
+        let leaves: Vec<[u8; 32]> = ["a", "b"].iter().map(|x| hash_str(x)).collect();
+        let proof = merkle_proof(&leaves, 0);
+        assert_eq!(proof.len(), 1);
+        assert_eq!(
+            proof[0].hash,
+            "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d"
+        );
+        assert_eq!(proof[0].position, Position::Right);
+
+        let proof = merkle_proof(&leaves, 1);
+        assert_eq!(proof.len(), 1);
+        assert_eq!(
+            proof[0].hash,
+            "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb"
+        );
+        assert_eq!(proof[0].position, Position::Left);
+    }
+
+    #[test]
     fn test_specific_proof_steps() {
         let leaves: Vec<[u8; 32]> = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
             .iter()
