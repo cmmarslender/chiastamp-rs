@@ -86,11 +86,11 @@ pub fn merkle_proof(leaves: &[[u8; 32]], index: usize) -> Vec<ProofStep> {
     proof
 }
 
-pub fn verify_proof(leaf: [u8; 32], root: [u8; 32], proof: &[ProofStep]) -> bool {
+pub fn verify_proof(leaf: [u8; 32], root: [u8; 32], proof: &[ProofStep]) -> anyhow::Result<bool> {
     let mut computed = leaf;
 
     for step in proof {
-        let sibling = hex::decode(&step.hash).unwrap();
+        let sibling = hex::decode(&step.hash)?;
         match step.position {
             Position::Left => {
                 computed = hash_pair(&sibling, &computed);
@@ -101,7 +101,7 @@ pub fn verify_proof(leaf: [u8; 32], root: [u8; 32], proof: &[ProofStep]) -> bool
         }
     }
 
-    computed == root
+    Ok(computed == root)
 }
 
 #[cfg(test)]

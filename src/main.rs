@@ -1,6 +1,6 @@
 use crate::merkle_tree::tree::{ProofStep, build_merkle_root, merkle_proof};
 use crate::models::{Batch, NewBatch, NewRecord, Record};
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, anyhow};
 use axum::http::StatusCode;
 use axum::{Json, Router, extract::State, http, routing::post};
 use chia_wallet_sdk::client::{
@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("installing AWS-LC provider failed");
 
-    let pool = get_connection_pool();
+    let pool = get_connection_pool()?;
     let background_pool = pool.clone();
     let state = AppState { db_pool: pool };
 
@@ -93,13 +93,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-pub fn get_connection_pool() -> Pool<ConnectionManager<MysqlConnection>> {
-    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+pub fn get_connection_pool() -> Result<Pool<ConnectionManager<MysqlConnection>>> {
+    let database_url = env::var("DATABASE_URL").map_err(|_e| anyhow!("DATABASE_URL must be set"))?;
     let manager = ConnectionManager::<MysqlConnection>::new(database_url);
     Pool::builder()
         .test_on_check_out(true)
         .build(manager)
-        .expect("Could not build connection pool")
+        .map_err(|_e| anyhow!("Failed to create pool"))
 }
 
 async fn stamp(
@@ -296,7 +296,7 @@ async fn background_task(pool: DbPool) -> Result<()> {
             )
             .set(schema::batches::block_hash.eq(Some(header_hash.as_slice())))
             .execute(&mut conn)
-            .map_err(|e| anyhow::anyhow!("Failed to update batch with block hash: {}", e))?;
+            .map_err(|_e| anyhow::anyhow!("Failed to update batch with block hash"))?;
 
             info!(
                 "Updated batch {} with block hash {}",
