@@ -17,7 +17,7 @@ use std::{env, net::SocketAddr};
 use tower_http::cors::{Any, CorsLayer};
 
 use bip39::Mnemonic;
-use chia::protocol::{RequestBlockHeader, RespondBlockHeader};
+use chia::protocol::{Bytes, RequestBlockHeader, RespondBlockHeader};
 use chia::{
     bls::{DerivableKey, SecretKey, Signature, master_to_wallet_unhardened_intermediate, sign},
     protocol::{Bytes32, CoinStateFilters, NewPeakWallet, ProtocolMessageTypes, SpendBundle},
@@ -479,13 +479,12 @@ async fn background_task(pool: DbPool) -> Result<()> {
         let mut spends = Spends::new(p2_puzzle_hash);
         spends.add(coin_states[0].coin);
 
-        // Set up a Vec<Action> to track the specific actions we want to perform in this spend
-        // Actions are a simple way to compose numerous types of outputs into a single spend
+        let memos = vec![ctx.alloc(&Bytes::from(root.as_slice()))?];
         let actions = vec![Action::send(
             Id::Xch,
             p2_puzzle_hash,
             coin_states[0].coin.amount,
-            ctx.memos(&root)?,
+            ctx.memos(&memos)?,
         )];
 
         // Apply the actions to the spend context and get the deltas (changes)
