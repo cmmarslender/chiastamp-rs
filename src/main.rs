@@ -8,7 +8,8 @@ use diesel::r2d2::Pool;
 use dotenvy::dotenv;
 use log::info;
 use serde::{Deserialize, Serialize};
-use std::{env, net::SocketAddr};
+use std::{env, net::SocketAddr, sync::Arc};
+use tokio::sync::Notify;
 use tower_http::cors::{Any, CorsLayer};
 
 pub mod merkle_tree;
@@ -41,7 +42,13 @@ async fn main() {
     env_logger::init();
 
     let pool = get_connection_pool();
+    let background_pool = pool.clone();
     let state = AppState { db_pool: pool };
+
+    // Spawn background task
+    let background_handle = tokio::spawn(async move {
+        background_task(background_pool).await;
+    });
 
     let port: u16 = env::var("PORT")
         .expect("PORT must be defined")
@@ -70,6 +77,13 @@ pub fn get_connection_pool() -> Pool<ConnectionManager<MysqlConnection>> {
         .test_on_check_out(true)
         .build(manager)
         .expect("Could not build connection pool")
+}
+
+/// Background task that runs concurrently with the web server
+async fn background_task(pool: DbPool) {
+    info!("Background task started");
+    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+    info!("Background task stopped");
 }
 
 async fn stamp(
