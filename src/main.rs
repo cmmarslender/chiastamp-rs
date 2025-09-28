@@ -7,8 +7,8 @@ use chia_wallet_sdk::client::{
     ClientError, PeerOptions, connect_peer, create_rustls_connector, load_ssl_cert,
 };
 use diesel::prelude::*;
-use diesel::r2d2::ConnectionManager;
 use diesel::r2d2::Pool;
+use diesel::r2d2::{ConnectionManager, PooledConnection};
 use dotenvy::dotenv;
 use log::info;
 use rustls::crypto::aws_lc_rs;
@@ -42,16 +42,23 @@ pub struct StampRequest {
     pub hash: String,
 }
 
-// @TODO we'll have to return some info about when this happened, so that once its in a block, we can look it up
-// and provide a full proof including block hash, coin ID, etc that it was included in
 #[derive(Serialize, Deserialize)]
-pub struct StampResponse {
+pub struct ProofRequest {
+    pub hash: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ProofResponse {
+    pub confirmed: bool,
+    pub header_hash: Option<String>,
+    pub coin_id: Option<String>,
     pub root_hash: String,
     pub leaf_hash: String,
     pub proof: Vec<ProofStep>,
 }
 
 pub type DbPool = Pool<ConnectionManager<MysqlConnection>>;
+pub type DbConnection = PooledConnection<ConnectionManager<MysqlConnection>>;
 #[derive(Clone)]
 pub struct AppState {
     pub db_pool: DbPool,
@@ -84,6 +91,7 @@ async fn main() -> Result<()> {
         .allow_headers(Any);
     let app = Router::new()
         .route("/stamp", post(stamp))
+        .route("/proof", post(proof))
         .with_state(state)
         .layer(cors);
 
@@ -106,7 +114,7 @@ pub fn get_connection_pool() -> Result<Pool<ConnectionManager<MysqlConnection>>>
 async fn stamp(
     State(state): State<AppState>,
     Json(payload): Json<StampRequest>,
-) -> Result<Json<StampResponse>, (StatusCode, String)> {
+) -> Result<Json<ProofResponse>, (StatusCode, String)> {
     let hash_bytes =
         hex::decode(payload.hash.as_str()).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     if hash_bytes.len() != 32 {
@@ -178,43 +186,120 @@ async fn stamp(
         "Record not found after insert".to_string(),
     ))?;
 
-    let other_records = schema::records::table
-        .filter(schema::records::batch_id.is_null())
-        .filter(schema::records::id.lt(current_record.id))
-        .order(schema::records::id.asc())
-        .get_results::<Record>(&mut conn)
-        .map_err(|_e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Error loading other records to compute partial proof".to_string(),
-            )
-        })?;
+    let records = records_up_to_record(conn, &current_record);
+    let leaves = records_to_leaves(&records).map_err(|_e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Unable to load leaves".to_string(),
+        )
+    })?;
+    let root = build_merkle_root(&leaves);
+    let index = leaves.iter().position(|&leaf| leaf == hash_array).ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Hash not found in leaves".to_string(),
+    ))?;
+    let proof = merkle_proof(&leaves, index);
 
-    // Get all the existing pending records into the tree
-    let mut current_leaves: Vec<[u8; 32]> = other_records
-        .iter()
-        .map(|x| {
-            x.hash.as_slice().try_into().map_err(|_| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Invalid hash format in database".to_string(),
-                )
-            })
-        })
-        .collect::<Result<Vec<[u8; 32]>, (StatusCode, String)>>()?;
-    // Add the new one
-    // This is current safe to do even if it's an old pending record, since
-    // we only fetch "current" leaves older than this hash
-    current_leaves.push(hash_array);
-
-    let root = build_merkle_root(&current_leaves);
-    let proof = merkle_proof(&current_leaves, current_leaves.len() - 1);
-
-    Ok(Json(StampResponse {
+    Ok(Json(ProofResponse {
+        confirmed: false,
+        header_hash: None,
+        coin_id: None,
         root_hash: hex::encode(root),
         leaf_hash: hex::encode(hash_array),
         proof,
     }))
+}
+
+async fn proof(
+    State(state): State<AppState>,
+    Json(payload): Json<ProofRequest>,
+) -> Result<Json<ProofResponse>, (StatusCode, String)> {
+    let hash_bytes =
+        hex::decode(payload.hash.as_str()).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    if hash_bytes.len() != 32 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid hash length. Expected 32 bytes.".to_string(),
+        ));
+    }
+    let hash_array: [u8; 32] = hash_bytes.try_into().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Failed to convert hash".to_string(),
+        )
+    })?;
+
+    // Check if record with same hash already exists
+    let mut conn = state.db_pool.get().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("DB connection error: {e}"),
+        )
+    })?;
+
+    let existing_record: Option<Record> = schema::records::table
+        .filter(schema::records::hash.eq(hash_array.as_slice()))
+        .first::<Record>(&mut conn)
+        .optional()
+        .map_err(|_e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Error checking for existing records".to_string(),
+            )
+        })?;
+
+    let Some(record) = existing_record else {
+        return Err((StatusCode::NOT_FOUND, "Hash not found".to_string()));
+    };
+
+    // @TODO Start a REPEATABLE READ transaction here, to ensure any new proofs or batches being processed don't get messed up
+    let existing_batch: Option<Batch> = schema::batches::table
+        .filter(schema::batches::id.eq(record.batch_id.unwrap_or(0)))
+        .first::<Batch>(&mut conn)
+        .optional()
+        .map_err(|_e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Error locating batch for provided hash".to_string(),
+            )
+        })?;
+
+    let mut proof_response = ProofResponse {
+        confirmed: false,
+        header_hash: None,
+        coin_id: None,
+        root_hash: String::new(),
+        leaf_hash: hex::encode(hash_array),
+        proof: vec![],
+    };
+    let records: Vec<Record>;
+    if let Some(batch) = existing_batch {
+        proof_response.coin_id = Some(hex::encode(batch.spent_coin));
+        if let Some(header_hash) = batch.block_hash {
+            proof_response.confirmed = true;
+            proof_response.header_hash = Some(hex::encode(header_hash));
+        }
+        records = records_for_batch(conn, batch.id);
+    } else {
+        records = records_up_to_record(conn, &record);
+    }
+    let leaves = records_to_leaves(&records).map_err(|_e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Unable to process leaves for batch".to_string(),
+        )
+    })?;
+
+    let root_hash = build_merkle_root(&leaves);
+    let index = leaves.iter().position(|&leaf| leaf == hash_array).ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Hash not found in leaves".to_string(),
+    ))?;
+    let proof = merkle_proof(&leaves, index);
+    proof_response.root_hash = hex::encode(root_hash);
+    proof_response.proof = proof;
+
+    Ok(Json(proof_response))
 }
 
 /// Background task that runs concurrently with the web server
@@ -334,8 +419,12 @@ async fn background_task(pool: DbPool) -> Result<()> {
             .filter(schema::records::batch_id.is_null())
             .order(schema::records::id.asc())
             .get_results::<Record>(&mut conn)?;
-        if pending_records.is_empty() {
-            info!("No pending records, not creating new batch");
+        // @TODO For now requiring at least 2 leaves so we get a proof with at least one entry
+        if pending_records.is_empty() || pending_records.len() < 2 {
+            info!(
+                "Not enough pending records ({}), not creating new batch",
+                pending_records.len()
+            );
             continue;
         }
         let leaves: Vec<[u8; 32]> = pending_records
@@ -461,4 +550,57 @@ fn get_key(mnemonic: &str, index: u32) -> Result<SecretKey> {
             .derive_unhardened(index)
             .derive_synthetic(),
     )
+}
+
+/// Fetches all records, in order, up to the given record
+/// Will either restrict to pending records (if the given record is pending)
+/// or else records from the same batch
+/// Used to construct a partial proof up to and including the given record
+fn records_up_to_record(mut conn: DbConnection, record: &Record) -> Vec<Record> {
+    let mut query = schema::records::table
+        .filter(schema::records::id.le(record.id))
+        .into_boxed();
+
+    if let Some(batch_id) = record.batch_id {
+        query = query.filter(schema::records::batch_id.eq(batch_id));
+    } else {
+        query = query.filter(schema::records::batch_id.is_null());
+    }
+
+    query
+        .order(schema::records::id.asc())
+        .get_results::<Record>(&mut conn)
+        .map_err(|_e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Error loading other records to compute partial proof".to_string(),
+            )
+        })
+        .unwrap_or(vec![])
+}
+
+fn records_for_batch(mut conn: DbConnection, batch_id: u32) -> Vec<Record> {
+    schema::records::table
+        .filter(schema::records::batch_id.eq(batch_id))
+        .order(schema::records::id.asc())
+        .get_results::<Record>(&mut conn)
+        .map_err(|_e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Error loading other records to compute partial proof".to_string(),
+            )
+        })
+        .unwrap_or(vec![])
+}
+
+fn records_to_leaves(records: &[Record]) -> Result<Vec<[u8; 32]>> {
+    records
+        .iter()
+        .map(|x| {
+            x.hash
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("Invalid hash format in database"))
+        })
+        .collect::<Result<Vec<[u8; 32]>, anyhow::Error>>()
 }
