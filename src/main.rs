@@ -251,7 +251,6 @@ async fn proof(
         return Err((StatusCode::NOT_FOUND, "Hash not found".to_string()));
     };
 
-    // @TODO Start a REPEATABLE READ transaction here, to ensure any new proofs or batches being processed don't get messed up
     let existing_batch: Option<Batch> = schema::batches::table
         .filter(schema::batches::id.eq(record.batch_id.unwrap_or(0)))
         .first::<Batch>(&mut conn)
