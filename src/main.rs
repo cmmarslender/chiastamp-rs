@@ -29,6 +29,7 @@ use chia_wallet_sdk::{
     driver::{Action, Id, Relation, SpendContext, Spends},
     signer::{AggSigConstants, RequiredSignature},
     types::TESTNET11_CONSTANTS,
+    types::MAINNET_CONSTANTS,
 };
 use indexmap::indexmap;
 use std::str::FromStr;
@@ -62,6 +63,7 @@ pub type DbConnection = PooledConnection<ConnectionManager<MysqlConnection>>;
 #[derive(Clone)]
 pub struct AppState {
     pub db_pool: DbPool,
+    pub network: String,
 }
 
 #[tokio::main]
@@ -72,13 +74,18 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("installing AWS-LC provider failed");
 
+    let network = env::var("NETWORK")?;
+    if !matches!(network.as_str(), "mainnet" | "testnet11") {
+        bail!("Unsupported network: {network}")
+    }
+
     let pool = get_connection_pool()?;
     let background_pool = pool.clone();
-    let state = AppState { db_pool: pool };
+    let state = AppState { db_pool: pool, network: network.clone() };
 
     // Spawn background task
     tokio::spawn(async move {
-        let _ = background_task(background_pool).await;
+        let _ = background_task(background_pool, &network).await;
     });
 
     let port: u16 = env::var("PORT")
@@ -301,13 +308,14 @@ async fn proof(
 }
 
 /// Background task that runs concurrently with the web server
-async fn background_task(pool: DbPool) -> Result<()> {
+async fn background_task(pool: DbPool, network: &str) -> Result<()> {
     info!("Starting Wallet Service");
     let ssl = load_ssl_cert("wallet.crt", "wallet.key")?;
     let connector = create_rustls_connector(&ssl)?;
+    let constants = if network == "testnet11" { &TESTNET11_CONSTANTS } else { &MAINNET_CONSTANTS };
 
     let (peer, mut receiver) = connect_peer(
-        "testnet11".to_string(),
+        network.to_string(),
         connector,
         format!("{}:{}", env::var("PEER_ADDRESS")?, env::var("PEER_PORT")?).parse()?,
         PeerOptions::default(),
@@ -351,7 +359,7 @@ async fn background_task(pool: DbPool) -> Result<()> {
                 .request_coin_state(
                     vec![Bytes32::try_from(&pending_batch_u.spent_coin)?],
                     None,
-                    TESTNET11_CONSTANTS.genesis_challenge,
+                    constants.genesis_challenge,
                     false,
                 )
                 .await?;
@@ -396,7 +404,7 @@ async fn background_task(pool: DbPool) -> Result<()> {
             .request_puzzle_state(
                 vec![p2_puzzle_hash],
                 None,
-                TESTNET11_CONSTANTS.genesis_challenge,
+                constants.genesis_challenge,
                 CoinStateFilters::new(false, true, false, 0),
                 false,
             )
@@ -502,7 +510,7 @@ async fn background_task(pool: DbPool) -> Result<()> {
         let required_signatures = RequiredSignature::from_coin_spends(
             &mut ctx,
             &coin_spends,
-            &AggSigConstants::new(TESTNET11_CONSTANTS.agg_sig_me_additional_data),
+            &AggSigConstants::new(constants.agg_sig_me_additional_data),
         )?;
 
         // Start with an empty signature that we'll aggregate individual signatures into
