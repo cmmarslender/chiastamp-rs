@@ -78,6 +78,7 @@ async fn main() -> Result<()> {
     if !matches!(network.as_str(), "mainnet" | "testnet11") {
         bail!("Unsupported network: {network}")
     }
+    info!("Configured network: {network}");
 
     let pool = get_connection_pool()?;
     let background_pool = pool.clone();
