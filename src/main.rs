@@ -86,7 +86,8 @@ async fn main() -> Result<()> {
 
     // Spawn background task
     tokio::spawn(async move {
-        let _ = background_task(background_pool, &network).await;
+        let background_result = background_task(background_pool, &network).await;
+        assert!(background_result.is_ok(), "Task failed due to error: {background_result:?}");
     });
 
     let port: u16 = env::var("PORT")
@@ -311,6 +312,9 @@ async fn proof(
 /// Background task that runs concurrently with the web server
 async fn background_task(pool: DbPool, network: &str) -> Result<()> {
     info!("Starting Wallet Service");
+    let minimum_records_str = env::var("MINIMUM_COMMIT").unwrap_or(1.to_string());
+    let minimum_records: u16 = minimum_records_str.parse()?;
+    info!("Minimum record count: {minimum_records}");
     let ssl = load_ssl_cert("wallet.crt", "wallet.key")?;
     let connector = create_rustls_connector(&ssl)?;
     let constants = if network == "testnet11" { &TESTNET11_CONSTANTS } else { &MAINNET_CONSTANTS };
@@ -426,10 +430,9 @@ async fn background_task(pool: DbPool, network: &str) -> Result<()> {
             .filter(schema::records::batch_id.is_null())
             .order(schema::records::id.asc())
             .get_results::<Record>(&mut conn)?;
-        // @TODO For now requiring at least 2 leaves so we get a proof with at least one entry
-        if pending_records.is_empty() || pending_records.len() < 2 {
+        if pending_records.is_empty() || pending_records.len() < minimum_records.into() {
             info!(
-                "Not enough pending records ({}), not creating new batch",
+                "Not enough pending records ({}/{minimum_records}), not creating new batch",
                 pending_records.len()
             );
             continue;
