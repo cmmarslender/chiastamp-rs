@@ -2,3 +2,4 @@
 .env
 wallet.crt
 wallet.key
+/k8s/
