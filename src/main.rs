@@ -68,17 +68,21 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    println!("Start");
     dotenv().ok();
+    println!("dotenv");
     env_logger::init();
+    println!("logger");
     aws_lc_rs::default_provider()
         .install_default()
         .expect("installing AWS-LC provider failed");
-
+    println!("aws-lc");
     let network = env::var("NETWORK")?;
     if !matches!(network.as_str(), "mainnet" | "testnet11") {
         bail!("Unsupported network: {network}")
     }
     info!("Configured network: {network}");
+    println!("network");
 
     let pool = get_connection_pool()?;
     let background_pool = pool.clone();
