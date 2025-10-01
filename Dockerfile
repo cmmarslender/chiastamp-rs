@@ -23,4 +23,5 @@ RUN cargo build --release
 ENV RUST_LOG=info
 #COPY --from=builder /app/target/release/chiastamp /chiastamp
 #CMD ["/chiastamp"]
+WORKDIR /app/target/release
 CMD ["/app/target/release/chiastamp"]
