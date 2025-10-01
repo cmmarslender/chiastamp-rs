@@ -6,6 +6,7 @@ use axum::{Json, Router, extract::State, http, routing::post};
 use chia_wallet_sdk::client::{
     ClientError, PeerOptions, connect_peer, create_rustls_connector, load_ssl_cert,
 };
+use chrono::Utc;
 use diesel::prelude::*;
 use diesel::r2d2::Pool;
 use diesel::r2d2::{ConnectionManager, PooledConnection};
@@ -338,6 +339,10 @@ async fn wallet_task(pool: DbPool, network: &str) -> Result<()> {
     let minimum_records_str = env::var("MINIMUM_COMMIT").unwrap_or(1.to_string());
     let minimum_records: u16 = minimum_records_str.parse()?;
     info!("Minimum record count: {minimum_records}");
+
+    let max_age_str = env::var("MAX_AGE").unwrap_or(300.to_string());
+    let max_age_seconds: u64 = max_age_str.parse()?;
+    info!("Max age for oldest record: {max_age_seconds} seconds");
     let ssl = load_ssl_cert("wallet.crt", "wallet.key")?;
     let connector = create_rustls_connector(&ssl)?;
     let constants = if network == "testnet11" {
@@ -458,11 +463,46 @@ async fn wallet_task(pool: DbPool, network: &str) -> Result<()> {
             .filter(schema::records::batch_id.is_null())
             .order(schema::records::id.asc())
             .get_results::<Record>(&mut conn)?;
-        if pending_records.is_empty() || pending_records.len() < minimum_records.into() {
-            info!(
-                "Not enough pending records ({}/{minimum_records}), not creating new batch",
-                pending_records.len()
-            );
+
+        // Check if we have enough records OR if the oldest record is too old
+        let should_create_batch = if pending_records.is_empty() {
+            false
+        } else if pending_records.len() >= minimum_records.into() {
+            true
+        } else {
+            // Check if the oldest pending record is older than MAX_AGE
+            let oldest_record = &pending_records[0];
+            let now = Utc::now().naive_utc();
+            let age_seconds = (now - oldest_record.created_at).num_seconds().max(0) as u64;
+
+            if age_seconds >= max_age_seconds {
+                info!(
+                    "Oldest pending record is {} seconds old (>= {}), creating batch despite only having {} records",
+                    age_seconds,
+                    max_age_seconds,
+                    pending_records.len()
+                );
+                true
+            } else {
+                false
+            }
+        };
+
+        if !should_create_batch {
+            if pending_records.is_empty() {
+                info!("No pending records, not creating new batch");
+            } else {
+                let oldest_record = &pending_records[0];
+                let now = Utc::now().naive_utc();
+                let age_seconds = (now - oldest_record.created_at).num_seconds().max(0) as u64;
+                info!(
+                    "Not enough pending records ({}/{}) and oldest record is only {} seconds old (< {}), not creating new batch",
+                    pending_records.len(),
+                    minimum_records,
+                    age_seconds,
+                    max_age_seconds
+                );
+            }
             continue;
         }
         let leaves: Vec<[u8; 32]> = pending_records
