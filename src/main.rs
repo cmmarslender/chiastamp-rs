@@ -28,8 +28,8 @@ use chia_wallet_sdk::utils::Address;
 use chia_wallet_sdk::{
     driver::{Action, Id, Relation, SpendContext, Spends},
     signer::{AggSigConstants, RequiredSignature},
-    types::TESTNET11_CONSTANTS,
     types::MAINNET_CONSTANTS,
+    types::TESTNET11_CONSTANTS,
 };
 use indexmap::indexmap;
 use std::str::FromStr;
@@ -86,12 +86,31 @@ async fn main() -> Result<()> {
 
     let pool = get_connection_pool()?;
     let background_pool = pool.clone();
-    let state = AppState { db_pool: pool, network: network.clone() };
+    let state = AppState {
+        db_pool: pool,
+        network: network.clone(),
+    };
 
-    // Spawn background task
+    // Spawn wallet task with restart logic
     tokio::spawn(async move {
-        let background_result = background_task(background_pool, &network).await;
-        assert!(background_result.is_ok(), "Task failed due to error: {background_result:?}");
+        loop {
+            log::info!("Starting wallet task...");
+            let wallet_result = wallet_task(background_pool.clone(), &network).await;
+
+            match wallet_result {
+                Ok(()) => {
+                    log::info!("Wallet task completed successfully");
+                    break; // Exit the restart loop if task completes normally
+                }
+                Err(e) => {
+                    log::error!("Wallet task failed: {e:?}");
+                    log::info!("Restarting wallet task in 5 seconds...");
+
+                    // Wait 5 seconds before restarting to avoid rapid restart loops
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
     });
 
     let port: u16 = env::var("PORT")
@@ -313,15 +332,19 @@ async fn proof(
     Ok(Json(proof_response))
 }
 
-/// Background task that runs concurrently with the web server
-async fn background_task(pool: DbPool, network: &str) -> Result<()> {
+/// Wallet task that runs concurrently with the web server
+async fn wallet_task(pool: DbPool, network: &str) -> Result<()> {
     info!("Starting Wallet Service");
     let minimum_records_str = env::var("MINIMUM_COMMIT").unwrap_or(1.to_string());
     let minimum_records: u16 = minimum_records_str.parse()?;
     info!("Minimum record count: {minimum_records}");
     let ssl = load_ssl_cert("wallet.crt", "wallet.key")?;
     let connector = create_rustls_connector(&ssl)?;
-    let constants = if network == "testnet11" { &TESTNET11_CONSTANTS } else { &MAINNET_CONSTANTS };
+    let constants = if network == "testnet11" {
+        &TESTNET11_CONSTANTS
+    } else {
+        &MAINNET_CONSTANTS
+    };
 
     let (peer, mut receiver) = connect_peer(
         network.to_string(),
@@ -339,8 +362,6 @@ async fn background_task(pool: DbPool, network: &str) -> Result<()> {
     let address = Address::new(p2_puzzle_hash, String::from_str("txch")?);
     info!("Address is {}", address.encode()?);
 
-    let mut conn = pool.get()?;
-
     // Sit around and wait for new messages from the connected peer
     // Ignore unless NewPeakWallet
     while let Some(message) = receiver.recv().await {
@@ -351,6 +372,9 @@ async fn background_task(pool: DbPool, network: &str) -> Result<()> {
         // When we receive a new peak, we want to get our balance and then make a spend
         let peak = NewPeakWallet::from_bytes(&message.data)?;
         info!("Received new peak {peak:?}");
+
+        // Get a fresh database connection for this iteration
+        let mut conn = pool.get()?;
 
         // If we have a pending batch, check if it has been confirmed
         // Check if we have a pending batch - if so, don't try and make a new one
