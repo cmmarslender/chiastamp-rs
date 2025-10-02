@@ -364,7 +364,8 @@ async fn wallet_task(pool: DbPool, network: &str) -> Result<()> {
     let sk = get_key(&mnemonic, 0)?;
     let pk = sk.public_key();
     let p2_puzzle_hash: Bytes32 = StandardArgs::curry_tree_hash(pk).into();
-    let address = Address::new(p2_puzzle_hash, String::from_str("txch")?);
+    let prefix = if network == "testnet11" { "txch" } else { "xch" };
+    let address = Address::new(p2_puzzle_hash, String::from_str(prefix)?);
     info!("Address is {}", address.encode()?);
 
     // Sit around and wait for new messages from the connected peer
