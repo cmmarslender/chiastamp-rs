@@ -22,22 +22,22 @@ impl Metrics {
         // Register by cloning the Arc and dereferencing to get &Gauge
         // The registry will store it, but we keep our Arc for updates
         registry.register(
-            "pending_proofs",
+            "chiastamp_pending_proofs",
             "Number of pending proofs not in a batch yet",
             (*pending_proofs).clone(),
         );
         registry.register(
-            "pending_batches",
+            "chiastamp_pending_batches",
             "Number of batches pending inclusion in a block",
             (*pending_batches).clone(),
         );
         registry.register(
-            "confirmed_batches",
+            "chiastamp_confirmed_batches",
             "Number of batches confirmed in a block",
             (*confirmed_batches).clone(),
         );
         registry.register(
-            "confirmed_proofs",
+            "chiastamp_confirmed_proofs",
             "Total number of proofs across all batches that have made it to blocks",
             (*confirmed_proofs).clone(),
         );
