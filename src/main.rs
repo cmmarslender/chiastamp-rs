@@ -1,4 +1,5 @@
 use crate::merkle_tree::tree::{ProofStep, build_merkle_root, merkle_proof};
+use crate::metrics::Metrics;
 use crate::models::{Batch, NewBatch, NewRecord, Record};
 use anyhow::{Result, anyhow, bail};
 use axum::http::StatusCode;
@@ -12,6 +13,7 @@ use dotenvy::dotenv;
 use log::{error, info, warn};
 use rustls::crypto::aws_lc_rs;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::{env, net::SocketAddr};
 use tower_http::cors::{Any, CorsLayer};
 
@@ -34,6 +36,7 @@ use indexmap::indexmap;
 use std::str::FromStr;
 
 pub mod merkle_tree;
+pub mod metrics;
 pub mod models;
 mod schema;
 
@@ -63,6 +66,7 @@ pub type DbConnection = PooledConnection<ConnectionManager<MysqlConnection>>;
 pub struct AppState {
     pub db_pool: DbPool,
     pub network: String,
+    pub metrics: Arc<Metrics>,
 }
 
 #[tokio::main]
@@ -85,16 +89,62 @@ async fn main() -> Result<()> {
 
     let pool = get_connection_pool()?;
     let background_pool = pool.clone();
+
+    // Initialize metrics
+    let metrics = Arc::new(Metrics::new());
+    let metrics_for_wallet = metrics.clone();
+    let metrics_for_server = metrics.clone();
+
+    // Initialize metrics from database
+    let initial_metrics_pool = pool.clone();
+    let initial_metrics = metrics.clone();
+    tokio::spawn(async move {
+        if let Err(e) = update_metrics_from_db(&initial_metrics_pool, &initial_metrics) {
+            error!("Failed to initialize metrics from database: {e:?}");
+        }
+    });
+
+    // Spawn periodic metrics update task (every 30 seconds)
+    let periodic_metrics_pool = pool.clone();
+    let periodic_metrics = metrics.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            if let Err(e) = update_metrics_from_db(&periodic_metrics_pool, &periodic_metrics) {
+                error!("Failed to update metrics periodically: {e:?}");
+            }
+        }
+    });
+
     let state = AppState {
         db_pool: pool,
         network: network.clone(),
+        metrics: metrics_for_server.clone(),
     };
+
+    // Spawn metrics server on alternate port
+    let metrics_port: u16 = env::var("METRICS_PORT")
+        .unwrap_or_else(|_| "9091".to_string())
+        .parse()
+        .expect("METRICS_PORT must be a valid u16");
+    let metrics_for_metrics_server = metrics.clone();
+    tokio::spawn(async move {
+        if let Err(e) = start_metrics_server(metrics_port, metrics_for_metrics_server).await {
+            error!("Metrics server error: {e:?}");
+        }
+    });
 
     // Spawn wallet task with restart logic
     tokio::spawn(async move {
         loop {
             info!("Starting wallet task...");
-            let wallet_result = wallet_task(background_pool.clone(), &network).await;
+            let wallet_result = wallet_task(
+                background_pool.clone(),
+                &network,
+                metrics_for_wallet.clone(),
+            )
+            .await;
 
             match wallet_result {
                 Ok(()) => {
@@ -209,6 +259,11 @@ async fn stamp(
                     )
                 })?,
         );
+
+        // Update metrics from database
+        if let Err(e) = update_metrics_from_db(&state.db_pool, &state.metrics) {
+            error!("Failed to update metrics after record creation: {e:?}");
+        }
     }
 
     // Now we need to get all pending records, in order, prior to the one we just inserted
@@ -309,7 +364,7 @@ async fn proof(
             proof_response.confirmed = true;
             proof_response.header_hash = Some(hex::encode(header_hash));
         }
-        records = records_for_batch(conn, batch.id);
+        records = records_for_batch(&mut conn, batch.id);
     } else {
         records = records_up_to_record(conn, &record);
     }
@@ -334,7 +389,7 @@ async fn proof(
 
 /// Wallet task that runs concurrently with the web server
 /// This function will return Ok(()) when the peer disconnects, which should trigger a reconnect
-async fn wallet_task(pool: DbPool, network: &str) -> Result<()> {
+async fn wallet_task(pool: DbPool, network: &str, metrics: Arc<Metrics>) -> Result<()> {
     info!("Starting Wallet Service");
     let minimum_records_str = env::var("MINIMUM_COMMIT").unwrap_or(1.to_string());
     let minimum_records: u16 = minimum_records_str.parse()?;
@@ -481,6 +536,12 @@ async fn wallet_task(pool: DbPool, network: &str) -> Result<()> {
                 pending_batch_u.id,
                 hex::encode(header_hash)
             );
+
+            // Update metrics from database
+            if let Err(e) = update_metrics_from_db(&pool, &metrics) {
+                error!("Failed to update metrics after batch confirmation: {e:?}");
+            }
+
             // @TODO probably need to deal with reorgs
             // @TODO probably store "how buried" this particular batch is?
         }
@@ -614,6 +675,11 @@ async fn wallet_task(pool: DbPool, network: &str) -> Result<()> {
             batch_id,
             pending_records.len()
         );
+
+        // Update metrics from database
+        if let Err(e) = update_metrics_from_db(&pool, &metrics) {
+            error!("Failed to update metrics after batch creation: {e:?}");
+        }
 
         // Create a new SpendContext, which helps create spendbundles in a simple manner
         let mut ctx = SpendContext::new();
@@ -765,11 +831,11 @@ fn records_up_to_record(mut conn: DbConnection, record: &Record) -> Vec<Record> 
         .unwrap_or(vec![])
 }
 
-fn records_for_batch(mut conn: DbConnection, batch_id: u32) -> Vec<Record> {
+fn records_for_batch(conn: &mut DbConnection, batch_id: u32) -> Vec<Record> {
     schema::records::table
         .filter(schema::records::batch_id.eq(batch_id))
         .order(schema::records::id.asc())
-        .get_results::<Record>(&mut conn)
+        .get_results::<Record>(conn)
         .map_err(|_e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -789,4 +855,98 @@ fn records_to_leaves(records: &[Record]) -> Result<Vec<[u8; 32]>> {
                 .map_err(|_| anyhow!("Invalid hash format in database"))
         })
         .collect::<Result<Vec<[u8; 32]>, anyhow::Error>>()
+}
+
+/// Start metrics server on a separate port
+async fn start_metrics_server(port: u16, metrics: Arc<Metrics>) -> Result<()> {
+    use axum::body::Body;
+    use axum::response::Response;
+    use axum::routing::get;
+
+    let metrics_app = Router::new().route(
+        "/metrics",
+        get(move || {
+            let metrics = metrics.clone();
+            async move {
+                match metrics.gather() {
+                    Ok(body) => Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Content-Type", "text/plain; version=0.0.4")
+                        .body(Body::from(body))
+                        .unwrap(),
+                    Err(e) => {
+                        error!("Failed to gather metrics: {e:?}");
+                        Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(Body::from(format!("Failed to gather metrics: {e}")))
+                            .unwrap()
+                    }
+                }
+            }
+        }),
+    );
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    info!("Metrics server listening on {addr}");
+    axum::serve(
+        tokio::net::TcpListener::bind(addr).await.unwrap(),
+        metrics_app,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Update all metrics from database state
+/// This function queries the database and updates all metrics based on current state
+fn update_metrics_from_db(pool: &DbPool, metrics: &Metrics) -> Result<()> {
+    use diesel::dsl::count;
+
+    let mut conn = pool
+        .get()
+        .map_err(|e| anyhow!("Failed to get DB connection: {e}"))?;
+
+    // Count pending proofs (records without batch_id)
+    let pending_proofs_count: i64 = schema::records::table
+        .filter(schema::records::batch_id.is_null())
+        .select(count(schema::records::id))
+        .first(&mut conn)
+        .unwrap_or(0);
+    metrics.pending_proofs.set(pending_proofs_count);
+
+    // Count pending batches (batches without block_hash)
+    let pending_batches_count: i64 = schema::batches::table
+        .filter(schema::batches::block_hash.is_null())
+        .select(count(schema::batches::id))
+        .first(&mut conn)
+        .unwrap_or(0);
+    metrics.pending_batches.set(pending_batches_count);
+
+    // Count confirmed batches (batches with block_hash)
+    let confirmed_batches_count: i64 = schema::batches::table
+        .filter(schema::batches::block_hash.is_not_null())
+        .select(count(schema::batches::id))
+        .first(&mut conn)
+        .unwrap_or(0);
+    metrics.confirmed_batches.set(confirmed_batches_count);
+
+    // Count confirmed proofs (records in confirmed batches)
+    // We'll use a subquery approach since direct join with nullable fields is tricky
+    let confirmed_batch_ids: Vec<u32> = schema::batches::table
+        .filter(schema::batches::block_hash.is_not_null())
+        .select(schema::batches::id)
+        .get_results(&mut conn)
+        .unwrap_or_default();
+
+    let confirmed_proofs_count: i64 = if confirmed_batch_ids.is_empty() {
+        0
+    } else {
+        schema::records::table
+            .filter(schema::records::batch_id.eq_any(confirmed_batch_ids))
+            .select(count(schema::records::id))
+            .first(&mut conn)
+            .unwrap_or(0)
+    };
+    metrics.confirmed_proofs.set(confirmed_proofs_count);
+
+    Ok(())
 }

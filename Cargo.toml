@@ -21,4 +21,5 @@ anyhow = "1.0.100"
 chia = "0.26.0"
 bip39 = "2.2.0"
 indexmap = "2.11.4"
+prometheus-client = "0.24"
 
