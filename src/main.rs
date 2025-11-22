@@ -3,15 +3,13 @@ use crate::models::{Batch, NewBatch, NewRecord, Record};
 use anyhow::{Result, anyhow, bail};
 use axum::http::StatusCode;
 use axum::{Json, Router, extract::State, http, routing::post};
-use chia_wallet_sdk::client::{
-    ClientError, PeerOptions, connect_peer, create_rustls_connector, load_ssl_cert,
-};
+use chia_wallet_sdk::client::{PeerOptions, connect_peer, create_rustls_connector, load_ssl_cert};
 use chrono::Utc;
 use diesel::prelude::*;
 use diesel::r2d2::Pool;
 use diesel::r2d2::{ConnectionManager, PooledConnection};
 use dotenvy::dotenv;
-use log::info;
+use log::{error, info, warn};
 use rustls::crypto::aws_lc_rs;
 use serde::{Deserialize, Serialize};
 use std::{env, net::SocketAddr};
@@ -95,17 +93,18 @@ async fn main() -> Result<()> {
     // Spawn wallet task with restart logic
     tokio::spawn(async move {
         loop {
-            log::info!("Starting wallet task...");
+            info!("Starting wallet task...");
             let wallet_result = wallet_task(background_pool.clone(), &network).await;
 
             match wallet_result {
                 Ok(()) => {
-                    log::info!("Wallet task completed successfully");
-                    break; // Exit the restart loop if task completes normally
+                    // Peer disconnected - this is expected and should trigger a reconnect
+                    warn!("Wallet task ended (peer disconnected). Restarting in 5 seconds...");
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                 }
                 Err(e) => {
-                    log::error!("Wallet task failed: {e:?}");
-                    log::info!("Restarting wallet task in 5 seconds...");
+                    error!("Wallet task failed: {e:?}");
+                    info!("Restarting wallet task in 5 seconds...");
 
                     // Wait 5 seconds before restarting to avoid rapid restart loops
                     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -334,6 +333,7 @@ async fn proof(
 }
 
 /// Wallet task that runs concurrently with the web server
+/// This function will return Ok(()) when the peer disconnects, which should trigger a reconnect
 async fn wallet_task(pool: DbPool, network: &str) -> Result<()> {
     info!("Starting Wallet Service");
     let minimum_records_str = env::var("MINIMUM_COMMIT").unwrap_or(1.to_string());
@@ -364,12 +364,17 @@ async fn wallet_task(pool: DbPool, network: &str) -> Result<()> {
     let sk = get_key(&mnemonic, 0)?;
     let pk = sk.public_key();
     let p2_puzzle_hash: Bytes32 = StandardArgs::curry_tree_hash(pk).into();
-    let prefix = if network == "testnet11" { "txch" } else { "xch" };
+    let prefix = if network == "testnet11" {
+        "txch"
+    } else {
+        "xch"
+    };
     let address = Address::new(p2_puzzle_hash, String::from_str(prefix)?);
     info!("Address is {}", address.encode()?);
 
     // Sit around and wait for new messages from the connected peer
     // Ignore unless NewPeakWallet
+    // When receiver.recv() returns None, the peer has disconnected
     while let Some(message) = receiver.recv().await {
         if message.msg_type != ProtocolMessageTypes::NewPeakWallet {
             continue;
@@ -380,54 +385,96 @@ async fn wallet_task(pool: DbPool, network: &str) -> Result<()> {
         info!("Received new peak {peak:?}");
 
         // Get a fresh database connection for this iteration
-        let mut conn = pool.get()?;
+        let mut conn = match pool.get() {
+            Ok(conn) => conn,
+            Err(e) => {
+                error!("Failed to get database connection: {e:?}");
+                continue;
+            }
+        };
 
         // If we have a pending batch, check if it has been confirmed
         // Check if we have a pending batch - if so, don't try and make a new one
-        let pending_batch = schema::batches::table
+        let pending_batch = match schema::batches::table
             .filter(schema::batches::block_hash.is_null())
             .get_result::<Batch>(&mut conn)
-            .optional()?;
+            .optional()
+        {
+            Ok(batch) => batch,
+            Err(e) => {
+                error!("Failed to query pending batch: {e:?}");
+                continue;
+            }
+        };
 
         if let Some(pending_batch_u) = pending_batch {
             info!(
                 "Have pending batch for coin ID {}",
                 hex::encode(&pending_batch_u.spent_coin)
             );
-            let coin_state = peer
-                .request_coin_state(
+
+            // Retry coin state request with error handling
+            let coin_state_result = retry_peer_operation(|| async {
+                peer.request_coin_state(
                     vec![Bytes32::try_from(&pending_batch_u.spent_coin)?],
                     None,
                     constants.genesis_challenge,
                     false,
                 )
-                .await?;
-            if coin_state.is_err() {
-                info!("Unable to check coin state. Waiting for confirmation");
-                continue;
-            }
-            let state_u = coin_state.unwrap();
-            if state_u.coin_states.is_empty() || state_u.coin_states[0].spent_height.is_none() {
+                .await
+                .map_err(|e| anyhow::anyhow!("ClientError: {e:?}"))
+            })
+            .await;
+
+            let coin_state = match coin_state_result {
+                Ok(Ok(state)) => state,
+                Ok(Err(e)) => {
+                    warn!("Unable to check coin state: {e:?}. Waiting for confirmation");
+                    continue;
+                }
+                Err(e) => {
+                    error!("Failed to check coin state after retries: {e:?}");
+                    continue;
+                }
+            };
+
+            if coin_state.coin_states.is_empty() || coin_state.coin_states[0].spent_height.is_none()
+            {
                 info!("Still pending. Waiting for confirmation...");
                 continue;
             }
 
-            let confirmed_height = state_u.coin_states[0].spent_height.unwrap();
+            let confirmed_height = coin_state.coin_states[0].spent_height.unwrap();
             info!("Coin was confirmed at height {confirmed_height}");
 
-            let block_header: std::result::Result<RespondBlockHeader, ClientError> = peer
-                .request_infallible(RequestBlockHeader::new(confirmed_height))
-                .await;
-            let header_hash = block_header?.header_block.header_hash();
+            let block_header_result: Result<RespondBlockHeader> = retry_peer_operation(|| async {
+                peer.request_infallible(RequestBlockHeader::new(confirmed_height))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("ClientError: {e:?}"))
+            })
+            .await;
+
+            let block_header = match block_header_result {
+                Ok(header) => header,
+                Err(e) => {
+                    error!("Failed to get block header after retries: {e:?}");
+                    continue;
+                }
+            };
+
+            let header_hash = block_header.header_block.header_hash();
             info!("Block header hash is {}", hex::encode(header_hash));
 
             // Update the batch record in the database with the block hash
-            diesel::update(
+            if let Err(e) = diesel::update(
                 schema::batches::table.filter(schema::batches::id.eq(pending_batch_u.id)),
             )
             .set(schema::batches::block_hash.eq(Some(header_hash.as_slice())))
             .execute(&mut conn)
-            .map_err(|_e| anyhow::anyhow!("Failed to update batch with block hash"))?;
+            {
+                error!("Failed to update batch with block hash: {e:?}");
+                continue;
+            }
 
             info!(
                 "Updated batch {} with block hash {}",
@@ -439,17 +486,30 @@ async fn wallet_task(pool: DbPool, network: &str) -> Result<()> {
         }
 
         // Request unspent coin states from the full node for our p2_puzzle_hash
-        let coin_states = peer
-            .request_puzzle_state(
+        // request_puzzle_state returns Result<Result<RespondPuzzleState, RejectPuzzleState>, ClientError>
+        let coin_states_result = retry_peer_operation(|| async {
+            peer.request_puzzle_state(
                 vec![p2_puzzle_hash],
                 None,
                 constants.genesis_challenge,
                 CoinStateFilters::new(false, true, false, 0),
                 false,
             )
-            .await?
-            .unwrap()
-            .coin_states;
+            .await
+            .map_err(|e| anyhow::anyhow!("ClientError: {e:?}"))
+            .and_then(|inner_result| {
+                inner_result.map_err(|e| anyhow::anyhow!("RejectPuzzleState: {e:?}"))
+            })
+        })
+        .await;
+
+        let coin_states = match coin_states_result {
+            Ok(state) => state.coin_states,
+            Err(e) => {
+                error!("Failed to request puzzle state after retries: {e:?}");
+                continue;
+            }
+        };
 
         // Calculate and print the balance
         let balance: u64 = coin_states.iter().map(|cs| cs.coin.amount).sum();
@@ -474,7 +534,8 @@ async fn wallet_task(pool: DbPool, network: &str) -> Result<()> {
             // Check if the oldest pending record is older than MAX_AGE
             let oldest_record = &pending_records[0];
             let now = Utc::now().naive_utc();
-            let age_seconds = (now - oldest_record.created_at).num_seconds().max(0) as u64;
+            let age_seconds =
+                u64::try_from((now - oldest_record.created_at).num_seconds().max(0)).unwrap_or(0);
 
             if age_seconds >= max_age_seconds {
                 info!(
@@ -495,7 +556,9 @@ async fn wallet_task(pool: DbPool, network: &str) -> Result<()> {
             } else {
                 let oldest_record = &pending_records[0];
                 let now = Utc::now().naive_utc();
-                let age_seconds = (now - oldest_record.created_at).num_seconds().max(0) as u64;
+                let age_seconds =
+                    u64::try_from((now - oldest_record.created_at).num_seconds().max(0))
+                        .unwrap_or(0);
                 info!(
                     "Not enough pending records ({}/{}) and oldest record is only {} seconds old (< {}), not creating new batch",
                     pending_records.len(),
@@ -610,14 +673,59 @@ async fn wallet_task(pool: DbPool, network: &str) -> Result<()> {
         let spend_bundle = SpendBundle::new(coin_spends, signature);
 
         // Send the resulting spendbundle to the network via the connected peer
-        let ack = peer.send_transaction(spend_bundle).await?;
-
-        info!("Transaction ack {ack:?}");
+        // Note: send_transaction consumes the spend_bundle, so we can't easily retry it
+        // If it fails, we'll log the error but continue - the transaction might have been sent
+        match peer.send_transaction(spend_bundle).await {
+            Ok(ack) => {
+                info!("Transaction ack {ack:?}");
+            }
+            Err(e) => {
+                error!("Failed to send transaction: {e:?}");
+                // Continue processing - the transaction might have been sent but ack failed
+                // The peer will reconnect and we can check the coin state later
+            }
+        }
     }
 
-    info!("Disconnected from peer {}", peer.socket_addr());
+    // When receiver.recv() returns None, the peer has disconnected
+    info!("Peer disconnected (receiver closed)");
+    Err(anyhow::anyhow!("Peer disconnected"))
+}
 
-    Ok(())
+/// Helper function to retry peer operations that might fail due to transient network issues
+async fn retry_peer_operation<F, Fut, T>(operation: F) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    const MAX_RETRIES: u32 = 3;
+    const RETRY_DELAY_SECS: u64 = 2;
+
+    let mut last_error = None;
+
+    for attempt in 1..=MAX_RETRIES {
+        match operation().await {
+            Ok(result) => {
+                if attempt > 1 {
+                    info!("Peer operation succeeded on attempt {attempt}");
+                }
+                return Ok(result);
+            }
+            Err(e) => {
+                let error_msg = format!("{e:?}");
+                last_error = Some(e);
+                if attempt < MAX_RETRIES {
+                    warn!(
+                        "Peer operation failed (attempt {attempt}/{MAX_RETRIES}): {error_msg}. Retrying in {RETRY_DELAY_SECS} seconds..."
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_secs(RETRY_DELAY_SECS)).await;
+                }
+            }
+        }
+    }
+
+    Err(last_error
+        .unwrap_or_else(|| anyhow::anyhow!("Operation failed after {MAX_RETRIES} attempts")))
 }
 
 fn get_key(mnemonic: &str, index: u32) -> Result<SecretKey> {
