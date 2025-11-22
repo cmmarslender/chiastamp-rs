@@ -125,7 +125,9 @@ async fn main() -> Result<()> {
 
     // Spawn metrics server on alternate port
     let metrics_port: u16 = env::var("METRICS_PORT")
-        .unwrap_or_else(|_| "9091".to_string())
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "9091".to_string())
         .parse()
         .expect("METRICS_PORT must be a valid u16");
     let metrics_for_metrics_server = metrics.clone();
