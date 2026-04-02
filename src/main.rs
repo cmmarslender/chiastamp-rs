@@ -15,6 +15,7 @@ use rustls::crypto::aws_lc_rs;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::{env, net::SocketAddr};
+use tokio::net::lookup_host;
 use tower_http::cors::{Any, CorsLayer};
 
 use bip39::Mnemonic;
@@ -408,10 +409,18 @@ async fn wallet_task(pool: DbPool, network: &str, metrics: Arc<Metrics>) -> Resu
         &MAINNET_CONSTANTS
     };
 
+    let peer_host = env::var("PEER_ADDRESS")?;
+    let peer_port = env::var("PEER_PORT")?;
+    let peer_addr: SocketAddr = lookup_host(format!("{peer_host}:{peer_port}"))
+        .await?
+        .next()
+        .ok_or_else(|| anyhow!("Could not resolve PEER_ADDRESS: {peer_host}"))?;
+    info!("Resolved peer address {peer_host} -> {peer_addr}");
+
     let (peer, mut receiver) = connect_peer(
         network.to_string(),
         connector,
-        format!("{}:{}", env::var("PEER_ADDRESS")?, env::var("PEER_PORT")?).parse()?,
+        peer_addr,
         PeerOptions::default(),
     )
     .await?;
