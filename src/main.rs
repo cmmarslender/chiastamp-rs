@@ -4,7 +4,9 @@ use crate::models::{Batch, NewBatch, NewRecord, Record};
 use anyhow::{Result, anyhow, bail};
 use axum::http::StatusCode;
 use axum::{Json, Router, extract::State, http, routing::post};
-use chia_wallet_sdk::client::{PeerOptions, connect_peer, create_rustls_connector, load_ssl_cert};
+use chia_wallet_sdk::client::{
+    Peer, PeerOptions, connect_peer, create_rustls_connector, load_ssl_cert,
+};
 use chrono::Utc;
 use diesel::prelude::*;
 use diesel::r2d2::Pool;
@@ -21,17 +23,21 @@ use tower_http::cors::{Any, CorsLayer};
 use bip39::Mnemonic;
 use chia::protocol::{Bytes, RequestBlockHeader, RespondBlockHeader};
 use chia::{
-    bls::{DerivableKey, SecretKey, Signature, master_to_wallet_unhardened_intermediate, sign},
-    protocol::{Bytes32, CoinStateFilters, NewPeakWallet, ProtocolMessageTypes, SpendBundle},
+    bls::{
+        DerivableKey, PublicKey, SecretKey, Signature, master_to_wallet_unhardened_intermediate,
+        sign,
+    },
+    clvm_traits::{FromClvm, ToClvm},
+    protocol::{Bytes32, Coin, CoinStateFilters, NewPeakWallet, ProtocolMessageTypes, SpendBundle},
     puzzles::{DeriveSynthetic, standard::StandardArgs},
     traits::Streamable,
 };
 use chia_wallet_sdk::utils::Address;
 use chia_wallet_sdk::{
     driver::{Action, Id, Relation, SpendContext, Spends},
+    prelude::{Allocator, NodePtr},
     signer::{AggSigConstants, RequiredSignature},
-    types::MAINNET_CONSTANTS,
-    types::TESTNET11_CONSTANTS,
+    types::{Condition, Conditions, MAINNET_CONSTANTS, TESTNET11_CONSTANTS, run_puzzle},
 };
 use indexmap::indexmap;
 use std::str::FromStr;
@@ -401,6 +407,11 @@ async fn wallet_task(pool: DbPool, network: &str, metrics: Arc<Metrics>) -> Resu
     let max_age_str = env::var("MAX_AGE").unwrap_or(300.to_string());
     let max_age_seconds: u64 = max_age_str.parse()?;
     info!("Max age for oldest record: {max_age_seconds} seconds");
+
+    let spend_retry_timeout_secs: i64 = env::var("SPEND_RETRY_TIMEOUT_SECS")
+        .unwrap_or(600.to_string())
+        .parse()?;
+    info!("Spend retry timeout: {spend_retry_timeout_secs} seconds");
     let ssl = load_ssl_cert("wallet.crt", "wallet.key")?;
     let connector = create_rustls_connector(&ssl)?;
     let constants = if network == "testnet11" {
@@ -506,12 +517,174 @@ async fn wallet_task(pool: DbPool, network: &str, metrics: Arc<Metrics>) -> Resu
 
             if coin_state.coin_states.is_empty() || coin_state.coin_states[0].spent_height.is_none()
             {
+                // Only retry when we have the coin struct (not just "missing from node")
+                if !coin_state.coin_states.is_empty() {
+                    // Use updated_at so the window resets after every retry attempt
+                    let age = (Utc::now().naive_utc() - pending_batch_u.updated_at).num_seconds();
+                    if age >= spend_retry_timeout_secs {
+                        warn!(
+                            "Pending batch {} last attempted {} seconds ago (>= {}), retrying spend...",
+                            pending_batch_u.id, age, spend_retry_timeout_secs
+                        );
+                        let pending_coin = coin_state.coin_states[0].coin;
+                        let root: [u8; 32] = match pending_batch_u.root_hash.as_slice().try_into() {
+                            Ok(r) => r,
+                            Err(e) => {
+                                error!(
+                                    "Invalid root_hash in DB for batch {}: {e:?}",
+                                    pending_batch_u.id
+                                );
+                                continue;
+                            }
+                        };
+                        build_and_send_spend(
+                            &peer,
+                            pending_coin,
+                            root,
+                            p2_puzzle_hash,
+                            pk,
+                            &sk,
+                            constants.agg_sig_me_additional_data,
+                        )
+                        .await;
+                        // Stamp updated_at regardless of send outcome so the next retry
+                        // waits another full timeout window
+                        if let Err(e) = diesel::update(
+                            schema::batches::table
+                                .filter(schema::batches::id.eq(pending_batch_u.id)),
+                        )
+                        .set(schema::batches::updated_at.eq(Utc::now().naive_utc()))
+                        .execute(&mut conn)
+                        {
+                            error!("Failed to update batch updated_at after retry: {e:?}");
+                        }
+                    }
+                }
                 info!("Still pending. Waiting for confirmation...");
                 continue;
             }
 
             let confirmed_height = coin_state.coin_states[0].spent_height.unwrap();
             info!("Coin was confirmed at height {confirmed_height}");
+
+            // Verify that the on-chain spend carries the expected memo (our root_hash)
+            // before we accept this confirmation. If the memo is wrong, re-spend the
+            // child coin with the correct memo instead of confirming the batch.
+            let expected_root: [u8; 32] = match pending_batch_u.root_hash.as_slice().try_into() {
+                Ok(r) => r,
+                Err(e) => {
+                    error!(
+                        "Invalid root_hash in DB for batch {}: {e:?}",
+                        pending_batch_u.id
+                    );
+                    continue;
+                }
+            };
+            let spent_coin_id = match Bytes32::try_from(pending_batch_u.spent_coin.as_slice()) {
+                Ok(id) => id,
+                Err(e) => {
+                    error!(
+                        "Invalid spent_coin in DB for batch {}: {e:?}",
+                        pending_batch_u.id
+                    );
+                    continue;
+                }
+            };
+
+            let ps_result = retry_peer_operation(|| async {
+                peer.request_puzzle_and_solution(spent_coin_id, confirmed_height)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("ClientError: {e:?}"))
+            })
+            .await;
+
+            match ps_result {
+                Ok(Ok(ps)) => {
+                    let mut allocator = Allocator::new();
+                    let memo_check: anyhow::Result<bool> = (|| -> anyhow::Result<bool> {
+                        let puzzle_ptr = ps.puzzle.to_clvm(&mut allocator)?;
+                        let solution_ptr = ps.solution.to_clvm(&mut allocator)?;
+                        let output = run_puzzle(&mut allocator, puzzle_ptr, solution_ptr)
+                            .map_err(|e| anyhow::anyhow!("run_puzzle: {e:?}"))?;
+                        let conditions = Conditions::<NodePtr>::from_clvm(&allocator, output)?;
+                        let memo_ok = conditions.iter().any(|cond| {
+                            if let Condition::CreateCoin(cc) = cond
+                                && cc.puzzle_hash == p2_puzzle_hash
+                                && let chia_wallet_sdk::types::conditions::Memos::Some(memo_ptr) =
+                                    &cc.memos
+                                && let Ok(memo_list) =
+                                    Vec::<Bytes>::from_clvm(&allocator, *memo_ptr)
+                                && let Some(first) = memo_list.first()
+                            {
+                                return first.as_ref() == expected_root;
+                            }
+                            false
+                        });
+                        Ok(memo_ok)
+                    })();
+
+                    match memo_check {
+                        Ok(true) => {
+                            info!("Memo verified for batch {}", pending_batch_u.id);
+                        }
+                        Ok(false) => {
+                            warn!(
+                                "Confirmed spend for batch {} has wrong memo! \
+                                 Deleting batch so records return to the pending pool.",
+                                pending_batch_u.id
+                            );
+                            // Un-assign records from this batch so they become pending again
+                            if let Err(e) = diesel::update(
+                                schema::records::table
+                                    .filter(schema::records::batch_id.eq(pending_batch_u.id)),
+                            )
+                            .set(schema::records::batch_id.eq(None::<u32>))
+                            .execute(&mut conn)
+                            {
+                                error!(
+                                    "Failed to un-assign records from batch {}: {e:?}",
+                                    pending_batch_u.id
+                                );
+                                continue;
+                            }
+                            // Delete the batch itself
+                            if let Err(e) = diesel::delete(
+                                schema::batches::table
+                                    .filter(schema::batches::id.eq(pending_batch_u.id)),
+                            )
+                            .execute(&mut conn)
+                            {
+                                error!("Failed to delete batch {}: {e:?}", pending_batch_u.id);
+                            }
+                            // The normal flow below will pick up the freed records
+                            // and create a new batch with the correct memo
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to parse puzzle/solution for batch {} memo check: {e:?}. \
+                                 Skipping memo check and proceeding with confirmation.",
+                                pending_batch_u.id
+                            );
+                        }
+                    }
+                }
+                Ok(Err(rejection)) => {
+                    warn!(
+                        "Puzzle/solution request rejected for batch {}: {rejection:?}. \
+                         Skipping memo check.",
+                        pending_batch_u.id
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to fetch puzzle/solution for batch {} after retries: {e:?}. \
+                         Skipping memo check.",
+                        pending_batch_u.id
+                    );
+                }
+            }
+            // Memo verified (or check skipped on RPC failure) — proceed to fetch block header
 
             let block_header_result: Result<RespondBlockHeader> = retry_peer_operation(|| async {
                 peer.request_infallible(RequestBlockHeader::new(confirmed_height))
@@ -692,17 +865,46 @@ async fn wallet_task(pool: DbPool, network: &str, metrics: Arc<Metrics>) -> Resu
             error!("Failed to update metrics after batch creation: {e:?}");
         }
 
+        build_and_send_spend(
+            &peer,
+            coin_states[0].coin,
+            root,
+            p2_puzzle_hash,
+            pk,
+            &sk,
+            constants.agg_sig_me_additional_data,
+        )
+        .await;
+    }
+
+    // When receiver.recv() returns None, the peer has disconnected
+    info!("Peer disconnected (receiver closed)");
+    Err(anyhow::anyhow!("Peer disconnected"))
+}
+
+/// Build a spend bundle for the given coin with the root hash as memo
+/// and send it to the network via the connected peer.
+async fn build_and_send_spend(
+    peer: &Peer,
+    coin: Coin,
+    root: [u8; 32],
+    p2_puzzle_hash: Bytes32,
+    pk: PublicKey,
+    sk: &SecretKey,
+    agg_sig_me_additional_data: Bytes32,
+) {
+    let result: Result<()> = async {
         // Create a new SpendContext, which helps create spendbundles in a simple manner
         let mut ctx = SpendContext::new();
         // Specify our p2_puzzle_hash as the address for change
         let mut spends = Spends::new(p2_puzzle_hash);
-        spends.add(coin_states[0].coin);
+        spends.add(coin);
 
         let memos = vec![ctx.alloc(&Bytes::from(root.as_slice()))?];
         let actions = vec![Action::send(
             Id::Xch,
             p2_puzzle_hash,
-            coin_states[0].coin.amount,
+            coin.amount,
             ctx.memos(&memos)?,
         )];
 
@@ -723,7 +925,7 @@ async fn wallet_task(pool: DbPool, network: &str, metrics: Arc<Metrics>) -> Resu
         let required_signatures = RequiredSignature::from_coin_spends(
             &mut ctx,
             &coin_spends,
-            &AggSigConstants::new(constants.agg_sig_me_additional_data),
+            &AggSigConstants::new(agg_sig_me_additional_data),
         )?;
 
         // Start with an empty signature that we'll aggregate individual signatures into
@@ -743,7 +945,7 @@ async fn wallet_task(pool: DbPool, network: &str, metrics: Arc<Metrics>) -> Resu
 
             // Sign the required message with our secret key and add it to the aggregated signature
             // The += operator combines signatures using BLS signature aggregation
-            signature += &sign(&sk, required.message());
+            signature += &sign(sk, required.message());
         }
 
         // Create a spendbundle with the final coin spends and signature
@@ -762,11 +964,14 @@ async fn wallet_task(pool: DbPool, network: &str, metrics: Arc<Metrics>) -> Resu
                 // The peer will reconnect and we can check the coin state later
             }
         }
-    }
 
-    // When receiver.recv() returns None, the peer has disconnected
-    info!("Peer disconnected (receiver closed)");
-    Err(anyhow::anyhow!("Peer disconnected"))
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = result {
+        error!("Failed to build and send spend: {e:?}");
+    }
 }
 
 /// Helper function to retry peer operations that might fail due to transient network issues
